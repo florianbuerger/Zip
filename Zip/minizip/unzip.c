@@ -14,6 +14,11 @@
 
    This program is distributed under the terms of the same license as zlib.
    See the accompanying LICENSE file for the full text of the license.
+   
+   Mar 8th, 2016 - Lucio Cosmo 
+   Fixed support for 64bit builds for archives with "PKWARE" password.
+   Changed long, unsigned long, unsigned to unsigned int in 
+   access functions to crctables and pkeys
 */
 
 #include <stdio.h>
@@ -160,8 +165,8 @@ typedef struct
                                         /* structure about the current file if we are decompressing it */
     int isZip64;                        /* is the current file zip64 */
 #ifndef NOUNCRYPT
-    unsigned long keys[3];              /* keys defining the pseudo-random sequence */
-    const unsigned long* pcrc_32_tab;
+    unsigned int keys[3];               /* keys defining the pseudo-random sequence */
+    const unsigned int* pcrc_32_tab;
 #endif
 } unz64_s;
 
@@ -394,7 +399,9 @@ local unzFile unzOpenInternal(const void *path, zlib_filefunc64_32_def* pzlib_fi
     unz64_s us;
     unz64_s *s;
     ZPOS64_T central_pos;
+    ZPOS64_T central_pos64;
     uLong uL;
+    ZPOS64_T uL64;
     voidpf filestream = NULL;
     ZPOS64_T number_entry_CD;
     int err = UNZ_OK;
@@ -419,8 +426,7 @@ local unzFile unzOpenInternal(const void *path, zlib_filefunc64_32_def* pzlib_fi
     us.filestream_with_CD = us.filestream;
     us.isZip64 = 0;
 
-    /* Use unz64local_SearchCentralDir first. Only based on the result
-       is it necessary to locate the unz64local_SearchCentralDir64 */
+    /* Search for end of central directory header */
     central_pos = unz64local_SearchCentralDir(&us.z_filefunc, us.filestream);
     if (central_pos)
     {
@@ -460,15 +466,13 @@ local unzFile unzOpenInternal(const void *path, zlib_filefunc64_32_def* pzlib_fi
         if (unz64local_getShort(&us.z_filefunc, us.filestream, &us.gi.size_comment) != UNZ_OK)
             err = UNZ_ERRNO;
 
-        if ((err == UNZ_OK) &&
-            ((us.gi.number_entry == 0xffff) || (us.size_central_dir == 0xffff) || (us.offset_central_dir == 0xffffffff)))
+        if (err == UNZ_OK)
         {
-            /* Format should be Zip64, as the central directory or file size is too large */
-            central_pos = unz64local_SearchCentralDir64(&us.z_filefunc, us.filestream, central_pos);
-            if (central_pos)
+            /* Search for Zip64 end of central directory header */
+            central_pos64 = unz64local_SearchCentralDir64(&us.z_filefunc, us.filestream, central_pos);
+            if (central_pos64)
             {
-                ZPOS64_T uL64;
-
+                central_pos = central_pos64;
                 us.isZip64 = 1;
 
                 if (ZSEEK64(us.z_filefunc, us.filestream, central_pos, ZLIB_FILEFUNC_SEEK_SET) != 0)
@@ -507,7 +511,7 @@ local unzFile unzOpenInternal(const void *path, zlib_filefunc64_32_def* pzlib_fi
                 if (unz64local_getLong64(&us.z_filefunc, us.filestream, &us.offset_central_dir) != UNZ_OK)
                     err = UNZ_ERRNO;
             }
-            else
+            else if ((us.gi.number_entry == 0xffff) || (us.size_central_dir == 0xffff) || (us.offset_central_dir == 0xffffffff))
                 err = UNZ_BADZIPFILE;
         }
     }
@@ -1157,7 +1161,10 @@ extern int ZEXPORT unzOpenCurrentFile3(unzFile file, int* method, int* level, in
         (compression_method != Z_BZIP2ED) &&
 #endif
         (compression_method != Z_DEFLATED))
-        err = UNZ_BADZIPFILE;
+    {
+        TRYFREE(pfile_in_zip_read_info);
+        return UNZ_BADZIPFILE;
+    }
 
     pfile_in_zip_read_info->crc32_wait = s->cur_file_info.crc;
     pfile_in_zip_read_info->crc32 = 0;
@@ -1191,7 +1198,7 @@ extern int ZEXPORT unzOpenCurrentFile3(unzFile file, int* method, int* level, in
 
             err = BZ2_bzDecompressInit(&pfile_in_zip_read_info->bstream, 0, 0);
             if (err == Z_OK)
-                pfile_in_zip_read_info->stream_initialised=Z_BZIP2ED;
+                pfile_in_zip_read_info->stream_initialised = Z_BZIP2ED;
             else
             {
                 TRYFREE(pfile_in_zip_read_info);
@@ -1233,9 +1240,10 @@ extern int ZEXPORT unzOpenCurrentFile3(unzFile file, int* method, int* level, in
     pfile_in_zip_read_info->stream.avail_in = (uInt)0;
 
     s->pfile_in_zip_read = pfile_in_zip_read_info;
-    s->pcrc_32_tab = NULL;
 
 #ifndef NOUNCRYPT
+    s->pcrc_32_tab = NULL;
+
     if ((password != NULL) && ((s->cur_file_info.flag & 1) != 0))
     {
         if (ZSEEK64(s->z_filefunc, s->filestream,
@@ -1245,7 +1253,8 @@ extern int ZEXPORT unzOpenCurrentFile3(unzFile file, int* method, int* level, in
 #ifdef HAVE_AES
         if (s->cur_file_info.compression_method == AES_METHOD)
         {
-            unsigned char passverify[AES_PWVERIFYSIZE];
+            unsigned char passverify_archive[AES_PWVERIFYSIZE];
+            unsigned char passverify_password[AES_PWVERIFYSIZE];
             unsigned char saltvalue[AES_MAXSALTLENGTH];
             uInt saltlength;
 
@@ -1257,11 +1266,14 @@ extern int ZEXPORT unzOpenCurrentFile3(unzFile file, int* method, int* level, in
 
             if (ZREAD64(s->z_filefunc, s->filestream, saltvalue, saltlength) != saltlength)
                 return UNZ_INTERNALERROR;
-            if (ZREAD64(s->z_filefunc, s->filestream, passverify, AES_PWVERIFYSIZE) != AES_PWVERIFYSIZE)
+            if (ZREAD64(s->z_filefunc, s->filestream, passverify_archive, AES_PWVERIFYSIZE) != AES_PWVERIFYSIZE)
                 return UNZ_INTERNALERROR;
 
             fcrypt_init(s->cur_file_info_internal.aes_encryption_mode, password, strlen(password), saltvalue,
-                passverify, &s->pfile_in_zip_read->aes_ctx);
+                passverify_password, &s->pfile_in_zip_read->aes_ctx);
+
+            if (memcmp(passverify_archive, passverify_password, AES_PWVERIFYSIZE) != 0)
+                return UNZ_BADPASSWORD;
 
             s->pfile_in_zip_read->rest_read_compressed -= saltlength + AES_PWVERIFYSIZE;
             s->pfile_in_zip_read->rest_read_compressed -= AES_AUTHCODESIZE;
@@ -1272,7 +1284,7 @@ extern int ZEXPORT unzOpenCurrentFile3(unzFile file, int* method, int* level, in
 #endif
         {
             int i;
-            s->pcrc_32_tab = (const unsigned long*)get_crc_table();
+            s->pcrc_32_tab = (const unsigned int*)get_crc_table();
             init_keys(password, s->keys, s->pcrc_32_tab);
 
             if (ZREAD64(s->z_filefunc, s->filestream, source, 12) < 12)
